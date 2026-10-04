@@ -1,0 +1,381 @@
+# Drishti v0.1 — Endpoint Agent & Pairing Schemas | Phase 01
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class PairingInitRequest(BaseModel):
+    agent_id: str = Field(..., description="Unique persistent identifier of the agent")
+    device_id: str = Field(..., description="Unique persistent identifier of the device")
+    hostname: str = Field(..., description="Device hostname")
+    os: str = Field(..., description="Operating system name (e.g. windows, darwin)")
+    os_version: str = Field(..., description="Operating system release/version")
+    mac: str | None = Field(default=None, description="Hardware MAC address where available")
+    current_ip: str | None = Field(default=None, description="Current primary IPv4/IPv6 address")
+    agent_version: str = Field(default="0.1.0", description="Endpoint agent semantic version")
+    is_demo: bool = Field(default=False, description="Whether endpoint agent is requesting demo pairing session")
+
+
+class PairingInitResponse(BaseModel):
+    session_id: str
+    pairing_code: str
+    expires_at: datetime
+    poll_interval_seconds: int = 3
+
+
+class PairingSubmitRequest(BaseModel):
+    pairing_code: str = Field(..., min_length=4, max_length=16, description="Human-readable pairing code displayed by agent")
+
+
+class EndpointAgentOut(BaseModel):
+    id: str
+    org_id: str
+    agent_id: str
+    device_id: str
+    hostname: str
+    os: str
+    os_version: str
+    mac: str | None = None
+    current_ip: str | None = None
+    agent_version: str
+    status: str  # ONLINE, STALE, OFFLINE
+    paired_at: datetime
+    registered_at: datetime
+    last_heartbeat: datetime | None = None
+
+
+class PairingSubmitResponse(BaseModel):
+    success: bool
+    message: str
+    agent: EndpointAgentOut
+
+
+class PairingConsumeRequest(BaseModel):
+    pairing_code: str
+    org_id: str | None = None
+
+
+class PairingConsumeResponse(BaseModel):
+    success: bool
+    message: str
+    agent: EndpointAgentOut
+
+
+class PairingStatusRequest(BaseModel):
+    session_id: str
+    agent_id: str
+
+
+class PairingStatusResponse(BaseModel):
+    status: str  # WAITING_FOR_PAIR, PAIRED, CONSUMED, EXPIRED, REJECTED
+    agent_token: str | None = None
+    org_id: str | None = None
+
+
+class HeartbeatRequest(BaseModel):
+    agent_id: str
+    device_id: str
+    timestamp: datetime
+    agent_version: str = "0.1.0"
+    collector_health: dict[str, Any] = Field(default_factory=dict)
+    connectivity: dict[str, Any] = Field(default_factory=dict)
+
+
+class HeartbeatResponse(BaseModel):
+    status: str = "ACK"
+    server_time: datetime
+    derived_status: str
+
+
+# Phase 02 — Endpoint Telemetry Schemas
+class ProcessTelemetryItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    pid: int
+    name: str
+    category: str = "SYSTEM_PROCESS"
+    cpu_percent: float | None = None
+    memory_mb: float | None = None
+    exe_path: str | None = None
+    username: str | None = None
+    started_at: str | None = None
+    start_time: str | None = None
+    observed_at: str | None = None
+    ppid: int | None = None
+    cmdline: list[str] | None = None
+    source: str | None = None
+
+    @model_validator(mode="after")
+    def populate_started_at(self) -> "ProcessTelemetryItem":
+        if not self.started_at and self.start_time:
+            self.started_at = self.start_time
+        return self
+
+
+class SoftwareTelemetryItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str
+    version: str | None = None
+    vendor: str | None = None
+    publisher: str | None = None
+    install_date: str | None = None
+    install_location: str | None = None
+    source: str = "registry_or_apps"
+    observed_at: str | None = None
+
+    @model_validator(mode="after")
+    def populate_vendor(self) -> "SoftwareTelemetryItem":
+        if not self.vendor and self.publisher:
+            self.vendor = self.publisher
+        return self
+
+
+class ServiceTelemetryItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str
+    display_name: str | None = None
+    status: str = "UNKNOWN"
+    start_type: str | None = "UNKNOWN"
+    pid: int | None = None
+    observed_at: str | None = None
+    source: str | None = None
+
+
+class ListeningPortTelemetryItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    port: int = 0
+    local_port: int | None = None
+    protocol: str = "TCP"
+    bind_address: str = "0.0.0.0"
+    local_address: str | None = None
+    pid: int | None = None
+    process_name: str | None = None
+    observed_at: str | None = None
+    source: str | None = None
+
+    @model_validator(mode="after")
+    def populate_port_and_bind(self) -> "ListeningPortTelemetryItem":
+        if (self.port == 0 or self.port is None) and self.local_port:
+            self.port = self.local_port
+        elif (self.local_port == 0 or self.local_port is None) and self.port:
+            self.local_port = self.port
+        if not self.bind_address or self.bind_address == "0.0.0.0":
+            if self.local_address:
+                self.bind_address = self.local_address
+        return self
+
+
+class SocketConnectionTelemetryItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    pid: int | None = None
+    process_name: str | None = None
+    protocol: str = "TCP"
+    local_address: str = ""
+    local_port: int = 0
+    remote_address: str = ""
+    remote_port: int = 0
+    state: str = "ESTABLISHED"
+    observed_at: str | None = None
+    source: str | None = None
+
+
+class BrowserProcessTelemetryItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    browser_name: str
+    pid: int | None = None
+    exe_path: str | None = None
+    observed_at: str | None = None
+    source: str | None = None
+
+
+class CpuTelemetry(BaseModel):
+    cores: int
+    usage_percent: float | None = None
+    per_core_supported: bool = False
+    per_core_usage: list[float] = Field(default_factory=list)
+    architecture: str = "arm64-v8a"
+
+
+class MemoryTelemetry(BaseModel):
+    total_bytes: int
+    available_bytes: int
+    used_bytes: int
+    low_memory: bool = False
+
+
+class StorageTelemetry(BaseModel):
+    total_bytes: int
+    available_bytes: int
+    used_bytes: int
+
+
+class BatteryTelemetry(BaseModel):
+    percentage: int
+    charging: bool
+    health: str = "GOOD"
+    temperature_c: float | None = None
+
+
+class NetworkTelemetry(BaseModel):
+    connection_type: str  # WI-FI, CELLULAR, ETHERNET, NONE
+    local_ip: str | None = None
+    interface_name: str | None = Field(default=None, alias="interface")
+    link_speed_kbps: int | None = None
+
+
+class SecurityPostureTelemetry(BaseModel):
+    screen_lock: bool = False
+    encryption: str = "ENCRYPTED"
+    developer_options: bool = False
+    usb_debugging: bool = False
+    verified_boot: str = "release-keys"
+    security_patch: str | None = None
+    biometric_capability: str = "AVAILABLE"
+    root_detected: bool = False
+
+
+class AppTelemetryItem(BaseModel):
+    package_name: str
+    label: str
+    version_name: str | None = None
+    version_code: int | None = None
+    classification: str = "USER_APP"
+    is_enabled: bool = True
+
+
+class EndpointTelemetrySubmitRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    agent_id: str
+    device_id: str
+    timestamp: datetime
+    hostname: str | None = None
+    os_name: str | None = None
+    os_version: str | None = None
+    endpoint_processes: list[ProcessTelemetryItem] | None = None
+    active_apps: list[str] | None = None
+    installed_software: list[SoftwareTelemetryItem] | None = None
+    services: list[ServiceTelemetryItem] | None = None
+    listening_ports: list[ListeningPortTelemetryItem] | None = None
+    process_connections: list[SocketConnectionTelemetryItem] | None = None
+    installed_browsers: list[str] | None = None
+    browser_processes: list[BrowserProcessTelemetryItem] | None = None
+    os_info: str | None = None
+    # Android & extended platform telemetry fields (backward-compatible)
+    device_model: str | None = None
+    manufacturer: str | None = None
+    sdk_version: int | None = None
+    cpu_info: CpuTelemetry | dict[str, Any] | None = None
+    memory_info: MemoryTelemetry | dict[str, Any] | None = None
+    storage_info: StorageTelemetry | dict[str, Any] | None = None
+    battery_info: BatteryTelemetry | dict[str, Any] | None = None
+    network_info: NetworkTelemetry | dict[str, Any] | None = None
+    security_posture: SecurityPostureTelemetry | dict[str, Any] | None = None
+    applications: list[AppTelemetryItem | dict[str, Any]] | None = None
+    device_info: dict[str, Any] | None = None
+    uptime_info: dict[str, Any] | None = None
+    foreground_app: dict[str, Any] | None = None
+    browser_visibility: dict[str, Any] | None = None
+    network_flows: list[dict[str, Any]] | None = None
+    capability_status: list[dict[str, Any]] | None = None
+    process_events: list[dict[str, Any]] | None = None
+    macos_telemetry: dict[str, Any] | None = None
+
+
+class EndpointTelemetrySubmitResponse(BaseModel):
+    success: bool = True
+    message: str
+    accepted_at: datetime
+    processes_count: int
+    software_count: int
+    services_count: int
+    ports_count: int
+
+
+class EndpointTelemetryOut(BaseModel):
+    device_id: str
+    agent_id: str
+    hostname: str | None = None
+    os_name: str | None = None
+    os_version: str | None = None
+    endpoint_processes: list[ProcessTelemetryItem] = Field(default_factory=list)
+    active_apps: list[str] = Field(default_factory=list)
+    installed_software: list[SoftwareTelemetryItem] = Field(default_factory=list)
+    services: list[ServiceTelemetryItem] = Field(default_factory=list)
+    listening_ports: list[ListeningPortTelemetryItem] = Field(default_factory=list)
+    process_connections: list[SocketConnectionTelemetryItem] = Field(default_factory=list)
+    installed_browsers: list[str] = Field(default_factory=list)
+    browser_processes: list[BrowserProcessTelemetryItem] = Field(default_factory=list)
+    os_info: str | None = None
+    last_updated: datetime | None = None
+    is_stale: bool = False
+    is_software_stale: bool = False
+    source: str = "endpoint_agent"
+    # Android & extended platform telemetry fields (backward-compatible)
+    device_model: str | None = None
+    manufacturer: str | None = None
+    sdk_version: int | None = None
+    cpu_info: CpuTelemetry | dict[str, Any] | None = None
+    memory_info: MemoryTelemetry | dict[str, Any] | None = None
+    storage_info: StorageTelemetry | dict[str, Any] | None = None
+    battery_info: BatteryTelemetry | dict[str, Any] | None = None
+    network_info: NetworkTelemetry | dict[str, Any] | None = None
+    security_posture: SecurityPostureTelemetry | dict[str, Any] | None = None
+    applications: list[AppTelemetryItem | dict[str, Any]] = Field(default_factory=list)
+    device_info: dict[str, Any] | None = None
+    uptime_info: dict[str, Any] | None = None
+    foreground_app: dict[str, Any] | None = None
+    browser_visibility: dict[str, Any] | None = None
+    network_flows: list[dict[str, Any]] = Field(default_factory=list)
+    capability_status: list[dict[str, Any]] = Field(default_factory=list)
+    process_events: list[dict[str, Any]] = Field(default_factory=list)
+    macos_telemetry: dict[str, Any] | None = None
+
+
+
+# Phase 03 — Vulnerability Intelligence Schemas
+class CorrelatedFindingOut(BaseModel):
+    finding_id: str
+    device_id: str
+    org_id: str
+    finding_state: str  # OPEN, EXPOSED, POTENTIAL_MATCH, VULNERABLE, KNOWN_EXPLOITED, NO_CONFIRMED_VULNERABILITY
+    observed_product: str
+    evidence_source: str  # endpoint_software | network_service
+    evidence_type: str
+    observed_vendor: str | None = None
+    observed_version: str | None = None
+    cve_id: str | None = None
+    title: str | None = None
+    summary: str | None = None
+    cvss: float = 0.0
+    severity: str = "none"
+    in_kev: bool = False
+    kev_date_added: str | None = None
+    ghsa_ids: list[str] = Field(default_factory=list)
+    affected_range_text: str | None = None
+    fixed_version_text: str | None = None
+    intel_sources: list[str] = Field(default_factory=list)
+    source_freshness: str = "live"  # live | cached | stale | source_unavailable
+    source_status_reason: str | None = None
+    source_details: dict[str, Any] = Field(default_factory=dict)
+    observed_at: str | None = None
+
+
+class SourceStatusOut(BaseModel):
+    source_name: str
+    available: bool = True
+    last_sync: str | None = None
+    error_reason: str | None = None
+    is_stale: bool = False
+
+
+class EndpointVulnerabilitiesResponse(BaseModel):
+    device_id: str
+    findings: list[CorrelatedFindingOut] = Field(default_factory=list)
+    total_findings: int = 0
+    vulnerable_count: int = 0
+    known_exploited_count: int = 0
+    potential_match_count: int = 0
+    source_statuses: list[SourceStatusOut] = Field(default_factory=list)
+
+

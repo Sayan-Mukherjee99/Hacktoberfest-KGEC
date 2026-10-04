@@ -1,0 +1,339 @@
+{
+  "timestamp": "2026-09-26T19:00:56.458621+00:00",
+  "horizon": 3,
+  "classes": [
+    "NORMAL_CONTINUATION",
+    "SUSPICIOUS_CONTINUATION",
+    "LIKELY_ESCALATION",
+    "POTENTIAL_LATERAL_MOVEMENT",
+    "POTENTIAL_RECONNAISSANCE_CONTINUATION"
+  ],
+  "input_features": [
+    "flow_duration",
+    "total_fwd_packets",
+    "total_bwd_packets",
+    "total_fwd_bytes",
+    "total_bwd_bytes",
+    "flow_bytes_per_sec",
+    "flow_packets_per_sec",
+    "fwd_iat_mean",
+    "fwd_iat_std",
+    "fwd_iat_max",
+    "fwd_iat_min",
+    "bwd_iat_mean",
+    "bwd_iat_std",
+    "flag_syn_count",
+    "flag_ack_count",
+    "flag_fin_count",
+    "flag_rst_count",
+    "flag_psh_count",
+    "flag_urg_count",
+    "fwd_avg_bytes_per_pkt",
+    "bwd_avg_bytes_per_pkt",
+    "active_mean",
+    "idle_mean",
+    "port_scan_score",
+    "mean_ttl",
+    "mean_tcp_window",
+    "payload_entropy"
+  ],
+  "split_strategy": "Chronological partition (70/15/15) with 8-step buffer gap (Zero Leakage)",
+  "models": {
+    "lstm_forecaster": {
+      "checkpoint": "lstm_forecaster.pt",
+      "metrics": {
+        "overall_accuracy": 0.5961,
+        "overall_macro_f1": 0.2055,
+        "horizon_steps": {
+          "T+1": {
+            "accuracy": 0.5955,
+            "macro_f1": 0.2067,
+            "weighted_f1": 0.4743,
+            "precision": 0.4821,
+            "recall": 0.5955,
+            "calibration_error": 0.1695,
+            "confusion_matrix": [
+              [
+                700,
+                26,
+                3,
+                0,
+                1
+              ],
+              [
+                348,
+                13,
+                0,
+                0,
+                0
+              ],
+              [
+                102,
+                5,
+                1,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            ]
+          },
+          "T+2": {
+            "accuracy": 0.5997,
+            "macro_f1": 0.2051,
+            "weighted_f1": 0.4704,
+            "precision": 0.4911,
+            "recall": 0.5997,
+            "calibration_error": 0.1572,
+            "confusion_matrix": [
+              [
+                710,
+                19,
+                2,
+                0,
+                0
+              ],
+              [
+                353,
+                7,
+                0,
+                0,
+                1
+              ],
+              [
+                103,
+                2,
+                2,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            ]
+          },
+          "T+3": {
+            "accuracy": 0.593,
+            "macro_f1": 0.2048,
+            "weighted_f1": 0.4683,
+            "precision": 0.4704,
+            "recall": 0.593,
+            "calibration_error": 0.1609,
+            "confusion_matrix": [
+              [
+                701,
+                26,
+                3,
+                0,
+                1
+              ],
+              [
+                354,
+                8,
+                0,
+                0,
+                0
+              ],
+              [
+                101,
+                3,
+                2,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            ]
+          }
+        }
+      }
+    },
+    "transformer_forecaster": {
+      "checkpoint": "transformer_forecaster.pt",
+      "metrics": {
+        "overall_accuracy": 0.608,
+        "overall_macro_f1": 0.2521,
+        "horizon_steps": {
+          "T+1": {
+            "accuracy": 0.6055,
+            "macro_f1": 0.2514,
+            "weighted_f1": 0.4592,
+            "precision": 0.3699,
+            "recall": 0.6055,
+            "calibration_error": 0.1261,
+            "confusion_matrix": [
+              [
+                726,
+                0,
+                4,
+                0,
+                0
+              ],
+              [
+                361,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                108,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            ]
+          },
+          "T+2": {
+            "accuracy": 0.6097,
+            "macro_f1": 0.2525,
+            "weighted_f1": 0.4618,
+            "precision": 0.3717,
+            "recall": 0.6097,
+            "calibration_error": 0.0982,
+            "confusion_matrix": [
+              [
+                731,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                361,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                107,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            ]
+          },
+          "T+3": {
+            "accuracy": 0.6088,
+            "macro_f1": 0.2524,
+            "weighted_f1": 0.4617,
+            "precision": 0.3718,
+            "recall": 0.6088,
+            "calibration_error": 0.1624,
+            "confusion_matrix": [
+              [
+                730,
+                0,
+                1,
+                0,
+                0
+              ],
+              [
+                361,
+                0,
+                1,
+                0,
+                0
+              ],
+              [
+                106,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            ]
+          }
+        }
+      }
+    },
+    "gnn_forecaster": {
+      "checkpoint": "gnn_forecaster.pt",
+      "architecture": "GNN + Topological Velocity (Delta Nodes, Delta Edges, Degree Fan-out)"
+    },
+    "fusion_forecaster": {
+      "checkpoint": "fusion_forecaster.pt",
+      "architecture": "Bimodal Fusion (LSTM Temporal Emb 128-d + Graph Dynamics Emb 64-d)"
+    }
+  }
+}

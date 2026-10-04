@@ -1,0 +1,877 @@
+# Drishti v0.1 — Telegram alert dispatcher | 12-Aug-2026
+"""Background service: every N seconds scan for high/critical findings and
+active network threats, then fire a Telegram message for each new one.
+
+Defensive scope: outbound NOTIFICATION only. No inbound listener, no webhook.
+All secrets come from env vars via Settings.
+"""
+from __future__ import annotations
+
+import html
+import json
+import logging
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.models import AssetVulnerability, LiveObservation, NetworkDevice, Service, Vulnerability
+from app.services.live_threats import detect_threats, DeviceView, DomainView
+from app.db import SessionLocal
+
+logger = logging.getLogger("drishti")
+
+_TICK_SECONDS = 30
+_running = False
+_thread: threading.Thread | None = None
+_initial_scan_done = False
+
+# dedup: track (type, id) pairs we have already alerted about
+_alerted: set[tuple[str, str]] = set()
+
+
+# — Telegram helpers —
+def _get_chat_ids(chat_id_conf: str) -> list[str]:
+    """Parse single or comma-separated chat IDs."""
+    if not chat_id_conf:
+        return []
+    return [c.strip() for c in chat_id_conf.split(",") if c.strip()]
+
+
+import subprocess
+import httpx
+
+
+def _send_telegram(bot_token: str, chat_id: str, html_text: str, plain_text: str | None = None) -> bool:
+    """Fire a message via the Telegram Bot API (sendMessage).
+    Uses curl.exe on Windows for native SChannel TLS renegotiation support,
+    with httpx as fallback. Returns True if successfully delivered, False otherwise.
+    """
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": html_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    # 1. Primary: Windows native curl.exe with SChannel TLS via stdin pipe
+    try:
+        data_json = json.dumps(payload)
+        proc = subprocess.run(
+            ["curl.exe", "-sS", "--max-time", "12", "-X", "POST", url, "-H", "Content-Type: application/json", "-d", "@-"],
+            input=data_json,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            res = json.loads(proc.stdout)
+            if res.get("ok"):
+                return True
+            if res.get("error_code") == 400 and plain_text:
+                fb_payload = json.dumps({
+                    "chat_id": chat_id,
+                    "text": plain_text,
+                    "disable_web_page_preview": True,
+                })
+                fb_proc = subprocess.run(
+                    ["curl.exe", "-sS", "--max-time", "12", "-X", "POST", url, "-H", "Content-Type: application/json", "-d", "@-"],
+                    input=fb_payload,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if fb_proc.returncode == 0 and fb_proc.stdout:
+                    fb_res = json.loads(fb_proc.stdout)
+                    return bool(fb_res.get("ok"))
+    except Exception as exc:
+        logger.debug("curl dispatch attempt failed: %s, falling back to httpx", exc)
+
+    # 2. Fallback: httpx
+    try:
+        resp = httpx.post(url, json=payload, timeout=12.0)
+        data = resp.json()
+        if resp.status_code == 200 and data.get("ok"):
+            return True
+
+        if resp.status_code == 429:
+            retry_after = data.get("parameters", {}).get("retry_after", 5)
+            logger.warning("telegram rate limited, retry after %ds", retry_after)
+            time.sleep(min(retry_after, 30))
+            return False
+
+        if resp.status_code == 400 and plain_text:
+            fb_payload = {
+                "chat_id": chat_id,
+                "text": plain_text,
+                "disable_web_page_preview": True,
+            }
+            fb_resp = httpx.post(url, json=fb_payload, timeout=12.0)
+            fb_data = fb_resp.json()
+            return bool(fb_resp.status_code == 200 and fb_data.get("ok"))
+
+        logger.error("telegram HTTP %s: %s", resp.status_code, resp.text[:200])
+        return False
+    except Exception as exc:
+        logger.error("telegram send failed: %s", exc)
+        return False
+
+
+def _dispatch_alert(bot_token: str, chat_id_conf: str, html_text: str, plain_text: str | None = None) -> bool:
+    """Send alert to all configured chat IDs. Returns True if delivered to at least one."""
+    chat_ids = _get_chat_ids(chat_id_conf)
+    if not chat_ids:
+        return False
+    any_success = False
+    for cid in chat_ids:
+        ok = _send_telegram(bot_token, cid, html_text, plain_text)
+        if ok:
+            any_success = True
+        time.sleep(0.5)  # Telegram per-chat rate safety
+    return any_success
+
+
+def _ist_timestamp(dt: datetime | None = None) -> str:
+    """Format datetime in Indian Standard Time (Asia/Kolkata, UTC+5:30)."""
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        ist_dt = dt.astimezone(ZoneInfo("Asia/Kolkata"))
+    except Exception:
+        ist_dt = dt.astimezone(timezone(timedelta(hours=5, minutes=30)))
+    return ist_dt.strftime("%d-%b-%Y %I:%M:%S %p IST")
+
+
+def make_finding_fingerprint(
+    org_id: str,
+    device_id: str,
+    cve_or_finding_id: str,
+    observed_version: str | None,
+    severity: str,
+    in_kev: bool = False,
+) -> tuple[str, str, str, str, str, bool]:
+    """Deterministic factual fingerprint for vulnerability alert deduplication:
+    (org_id, device_id, cve_or_finding_id, observed_version, severity, in_kev).
+    """
+    return (
+        str(org_id),
+        str(device_id),
+        str(cve_or_finding_id),
+        str(observed_version or "unknown").strip().lower(),
+        str(severity).strip().lower(),
+        bool(in_kev),
+    )
+
+
+def clear_alerted_cache() -> None:
+    """Clear deduplication cache (used for test isolation)."""
+    global _alerted, _initial_scan_done
+    _alerted.clear()
+    _initial_scan_done = False
+
+
+def get_alerted_count() -> int:
+    return len(_alerted)
+
+
+def _format_finding_alert(f) -> tuple[str, str]:
+    """Returns (html_message, plain_text_fallback) for database AssetVulnerability."""
+    vuln = getattr(f, "vulnerability", None)
+    asset = getattr(f, "asset", None)
+    sev = vuln.severity.upper() if vuln and getattr(vuln, "severity", None) else "HIGH"
+    title = vuln.title if vuln and getattr(vuln, "title", None) else "Unknown vulnerability"
+    dev_name = (
+        asset.hostname if asset and getattr(asset, "hostname", None)
+        else (asset.ip if asset and getattr(asset, "ip", None) else getattr(f, "asset_id", "")[:8])
+    )
+    asset_ip = asset.ip if asset and getattr(asset, "ip", None) else "Not available"
+    cve = vuln.cve_id if vuln and getattr(vuln, "cve_id", None) else "N/A"
+    detected_time = _ist_timestamp(getattr(f, "detected_at", None))
+    status_str = str(getattr(f, "status", "OPEN")).upper()
+
+    html_msg = (
+        f"🚨 <b>[DRISHTI ALERT — {html.escape(sev)}]</b>\n"
+        f"<b>{html.escape(title)}</b>\n\n"
+        f"• <b>Device:</b> <code>{html.escape(dev_name)}</code>\n"
+        f"• <b>IP:</b> <code>{html.escape(asset_ip)}</code>\n"
+        f"• <b>CVE:</b> <code>{html.escape(cve)}</code>\n"
+        f"• <b>Severity:</b> <code>{html.escape(sev)}</code>\n"
+        f"• <b>Status:</b> <code>{html.escape(status_str)}</code>\n"
+        f"• <b>Time:</b> <code>{html.escape(detected_time)}</code>\n\n"
+        f"🛡️ <i>Drishti Cyber Threat Intelligence</i>"
+    )
+
+    plain_msg = (
+        f"[DRISHTI ALERT — {sev}]\n"
+        f"{title}\n\n"
+        f"• Device: {dev_name}\n"
+        f"• IP: {asset_ip}\n"
+        f"• CVE: {cve}\n"
+        f"• Severity: {sev}\n"
+        f"• Status: {status_str}\n"
+        f"• Time: {detected_time}\n\n"
+        f"Drishti Cyber Threat Intelligence"
+    )
+    return html_msg, plain_msg
+
+
+def _format_endpoint_finding_alert(c_finding, telemetry: dict) -> tuple[str, str]:
+    """Returns (html_message, plain_text_fallback) for endpoint CorrelatedFinding."""
+    sev = c_finding.severity.upper() if c_finding.severity else "HIGH"
+    title = c_finding.title or c_finding.summary or f"Vulnerability in {c_finding.observed_product}"
+    hostname = telemetry.get("hostname") or c_finding.device_id
+    ip = telemetry.get("ip") or c_finding.device_id
+    cve = c_finding.cve_id or "Not available"
+    prod = c_finding.observed_product or "unknown"
+    ver = c_finding.observed_version or "Not available"
+    fixed_ver = c_finding.fixed_version_text or "<patched-version>"
+    in_kev = bool(c_finding.in_kev)
+    kev_header_html = "🚨 <b>KNOWN EXPLOITED — CISA KEV</b>\n" if in_kev else ""
+    kev_header_plain = "🚨 KNOWN EXPLOITED — CISA KEV\n" if in_kev else ""
+    kev_label = "YES — Listed in CISA KEV" if in_kev else "NO"
+    detected_time = _ist_timestamp(None)
+
+    html_msg = (
+        f"🚨 <b>[DRISHTI SECURITY ALERT — {html.escape(sev)}]</b>\n"
+        f"{kev_header_html}"
+        f"<b>{html.escape(title)}</b>\n\n"
+        f"• <b>Device:</b> <code>{html.escape(hostname)}</code>\n"
+        f"• <b>IP:</b> <code>{html.escape(ip)}</code>\n"
+        f"• <b>Product:</b> <code>{html.escape(prod)}</code>\n"
+        f"• <b>Version:</b> <code>{html.escape(ver)}</code>\n"
+        f"• <b>CVE:</b> <code>{html.escape(cve)}</code>\n"
+        f"• <b>Severity:</b> <code>{html.escape(sev)}</code>\n"
+        f"• <b>Fixed Version:</b> <code>{html.escape(fixed_ver)}</code>\n"
+        f"• <b>KEV:</b> <code>{html.escape(kev_label)}</code>\n"
+        f"• <b>Status:</b> <code>REQUIRES REVIEW</code>\n"
+        f"• <b>Time:</b> <code>{html.escape(detected_time)}</code>\n\n"
+        f"🛡️ <i>Drishti Endpoint Intelligence</i>"
+    )
+
+    plain_msg = (
+        f"[DRISHTI SECURITY ALERT — {sev}]\n"
+        f"{kev_header_plain}"
+        f"{title}\n\n"
+        f"• Device: {hostname}\n"
+        f"• IP: {ip}\n"
+        f"• Product: {prod}\n"
+        f"• Version: {ver}\n"
+        f"• CVE: {cve}\n"
+        f"• Severity: {sev}\n"
+        f"• Fixed Version: {fixed_ver}\n"
+        f"• KEV: {kev_label}\n"
+        f"• Status: REQUIRES REVIEW\n"
+        f"• Time: {detected_time}\n\n"
+        f"Drishti Endpoint Intelligence"
+    )
+    return html_msg, plain_msg
+
+
+def _format_threat_alert(t) -> tuple[str, str]:
+    """Returns (html_message, plain_text_fallback)."""
+    emoji = "🚨" if t.severity in ("critical", "high") else "⚠️"
+    kind = t.kind.replace("_", " ").title()
+    alert_time = _ist_timestamp(getattr(t, "last_seen", None))
+    mitre = t.mitre or "N/A"
+    sev = t.severity.upper()
+
+    html_msg = (
+        f"{emoji} <b>[DRISHTI NETWORK THREAT — {html.escape(sev)}]</b>\n"
+        f"<b>{html.escape(kind)}: {html.escape(t.title)}</b>\n\n"
+        f"• <b>Detail:</b> {html.escape(t.detail)}\n"
+        f"• <b>MITRE ATT&CK:</b> <code>{html.escape(mitre)}</code>\n"
+        f"• <b>Time:</b> <code>{html.escape(alert_time)}</code>\n\n"
+        f"🛡️ <i>Drishti Live Watcher</i>"
+    )
+
+    plain_msg = (
+        f"[DRISHTI NETWORK THREAT — {sev}]\n"
+        f"{kind}: {t.title}\n\n"
+        f"• Detail: {t.detail}\n"
+        f"• MITRE ATT&CK: {mitre}\n"
+        f"• Time: {alert_time}\n\n"
+        f"Drishti Live Watcher"
+    )
+    return html_msg, plain_msg
+
+
+def _format_paired_device_packet_risk_alert(
+    device_ip: str,
+    device_name: str,
+    device_id: str | None,
+    packet_info: dict,
+    risk_score: float,
+    verdict: str,
+    attack_category: str,
+    threat_details: str,
+    forecast_progression: str | None = None,
+    recommended_action: str | None = None,
+    observed_at: datetime | None = None,
+) -> tuple[str, str]:
+    """Returns (html_message, plain_text_fallback) for a high-risk packet observed on a paired device."""
+    sev = "CRITICAL" if risk_score >= 0.85 or verdict.upper() == "ANOMALOUS" else "HIGH"
+    detected_time = _ist_timestamp(observed_at)
+
+    src = packet_info.get("src_ip", device_ip)
+    dst = packet_info.get("dst_ip", "unknown-dest")
+    sport = packet_info.get("src_port", 0)
+    dport = packet_info.get("dst_port", 0)
+    proto = str(packet_info.get("protocol", "TCP")).upper()
+    if proto == "6":
+        proto = "TCP"
+    elif proto == "17":
+        proto = "UDP"
+    elif proto == "1":
+        proto = "ICMP"
+
+    pkts = packet_info.get("packets", 1)
+    bytes_cnt = packet_info.get("bytes", 64)
+    proc_name = packet_info.get("process_name")
+    website_url = packet_info.get("website_url")
+    destination_host = packet_info.get("destination_host")
+    web_target = website_url or (f"http://{destination_host}:{dport}" if destination_host else None)
+    url_score = packet_info.get("url_trust_score")
+    url_band = packet_info.get("url_risk_band")
+
+    summary = packet_info.get("summary") or packet_info.get("signature") or f"{proto} flow to {dst}:{dport}"
+
+    proc_line_html = f"• <b>Process / App:</b> <code>{html.escape(proc_name)}</code>\n" if proc_name else ""
+    proc_line_plain = f"• Process / App: {proc_name}\n" if proc_name else ""
+
+    web_line_html = f"• <b>Target Website / Host:</b> <code>{html.escape(web_target)}</code>\n" if web_target else ""
+    web_line_plain = f"• Target Website / Host: {web_target}\n" if web_target else ""
+
+    url_trust_html = (
+        f"• <b>URL Trust Score:</b> <code>{url_score:.1f}/100 ({html.escape(str(url_band))})</code>\n"
+        if url_score is not None
+        else ""
+    )
+    url_trust_plain = (
+        f"• URL Trust Score: {url_score:.1f}/100 ({url_band})\n"
+        if url_score is not None
+        else ""
+    )
+
+    forecast_line_html = f"🔮 <b>Forecasting:</b> <code>{html.escape(forecast_progression)}</code>\n\n" if forecast_progression else ""
+    forecast_line_plain = f"Forecasting: {forecast_progression}\n\n" if forecast_progression else ""
+
+    rec_text = recommended_action or "Isolate device from network and inspect active connections."
+
+    html_msg = (
+        f"🚨 <b>[DRISHTI PAIRED DEVICE ALERT — {html.escape(sev)}]</b>\n"
+        f"<b>High-Risk Network Packet Detected</b>\n\n"
+        f"• <b>Device IP:</b> <code>{html.escape(device_ip)}</code>\n"
+        f"• <b>Device Name:</b> <code>{html.escape(device_name or 'Paired Endpoint')}</code>\n"
+        f"• <b>Device ID:</b> <code>{html.escape(device_id or 'unknown')}</code>\n"
+        f"• <b>Pairing Status:</b> <code>PAIRED &amp; AUTHENTICATED</code>\n"
+        f"• <b>Risk Score:</b> <code>{risk_score:.2f} ({html.escape(sev)})</code>\n"
+        f"• <b>Threat Verdict:</b> <code>{html.escape(verdict.upper())}</code>\n"
+        f"• <b>Attack Category:</b> <code>{html.escape(attack_category.upper())}</code>\n\n"
+        f"📦 <b>Suspicious Packet Details:</b>\n"
+        f"• <b>Protocol:</b> <code>{html.escape(proto)}</code>\n"
+        f"• <b>Flow:</b> <code>{html.escape(str(src))}:{sport} ➔ {html.escape(str(dst))}:{dport}</code>\n"
+        f"• <b>Volume:</b> <code>{pkts} packets ({bytes_cnt} bytes)</code>\n"
+        f"{proc_line_html}"
+        f"{web_line_html}"
+        f"{url_trust_html}"
+        f"• <b>Packet Info:</b> <code>{html.escape(summary)}</code>\n\n"
+        f"ℹ️ <b>Threat Analysis:</b>\n"
+        f"{html.escape(threat_details or 'Neural anomaly detector flagged abnormal packet sequence on paired device.')}\n\n"
+        f"{forecast_line_html}"
+        f"🛡️ <b>Recommended Action:</b>\n"
+        f"{html.escape(rec_text)}\n\n"
+        f"⏰ <b>Observed At:</b> <code>{html.escape(detected_time)}</code>\n\n"
+        f"🛡️ <i>Drishti Autonomous Paired Device Intelligence</i>"
+    )
+
+    plain_msg = (
+        f"[DRISHTI PAIRED DEVICE ALERT — {sev}]\n"
+        f"High-Risk Network Packet Detected\n\n"
+        f"• Device IP: {device_ip}\n"
+        f"• Device Name: {device_name or 'Paired Endpoint'}\n"
+        f"• Device ID: {device_id or 'unknown'}\n"
+        f"• Pairing Status: PAIRED & AUTHENTICATED\n"
+        f"• Risk Score: {risk_score:.2f} ({sev})\n"
+        f"• Threat Verdict: {verdict.upper()}\n"
+        f"• Attack Category: {attack_category.upper()}\n\n"
+        f"Suspicious Packet Details:\n"
+        f"• Protocol: {proto}\n"
+        f"• Flow: {src}:{sport} -> {dst}:{dport}\n"
+        f"• Volume: {pkts} packets ({bytes_cnt} bytes)\n"
+        f"{proc_line_plain}"
+        f"{web_line_plain}"
+        f"{url_trust_plain}"
+        f"• Packet Info: {summary}\n\n"
+        f"Threat Analysis:\n"
+        f"{threat_details or 'Neural anomaly detector flagged abnormal packet sequence on paired device.'}\n\n"
+        f"{forecast_line_plain}"
+        f"Recommended Action:\n"
+        f"{rec_text}\n\n"
+        f"Observed At: {detected_time}\n\n"
+        f"Drishti Autonomous Paired Device Intelligence"
+    )
+    return html_msg, plain_msg
+
+
+def notify_paired_device_packet_risk(
+    org_id: str,
+    device_ip: str,
+    packet_info: dict,
+    device_name: str | None = None,
+    device_id: str | None = None,
+    risk_score: float = 0.85,
+    verdict: str = "ANOMALOUS",
+    attack_category: str = "HIGH_RISK_PACKET",
+    threat_details: str = "",
+    forecast_progression: str | None = None,
+    recommended_action: str | None = None,
+    observed_at: datetime | None = None,
+    bot_token: str | None = None,
+    chat_id_conf: str | None = None,
+) -> bool:
+    """Dispatches a Telegram alert when a high-risk packet or flow is detected on a paired device.
+    
+    Includes device IP, paired device name/ID, suspicious packet 5-tuple, volume,
+    threat classification, forensic reasoning, and mitigation recommendations.
+    """
+    from app.config import get_settings
+    s = get_settings()
+    token = bot_token or s.telegram_bot_token
+    chat_ids = chat_id_conf or s.telegram_chat_id
+
+    if not token or not chat_ids:
+        logger.debug("Telegram alerts not configured; skipping paired device packet risk alert")
+        return False
+
+    src = packet_info.get("src_ip", device_ip)
+    dst = packet_info.get("dst_ip", "")
+    sport = packet_info.get("src_port", 0)
+    dport = packet_info.get("dst_port", 0)
+    proto = packet_info.get("protocol", "TCP")
+    flow_sig = f"{src}:{sport}->{dst}:{dport}:{proto}"
+
+    dedup_key = ("paired_packet_risk", str(org_id), str(device_ip), flow_sig, str(attack_category).upper())
+    if dedup_key in _alerted:
+        return False
+
+    html_msg, plain_msg = _format_paired_device_packet_risk_alert(
+        device_ip=device_ip,
+        device_name=device_name or "Paired Endpoint",
+        device_id=device_id,
+        packet_info=packet_info,
+        risk_score=risk_score,
+        verdict=verdict,
+        attack_category=attack_category,
+        threat_details=threat_details,
+        forecast_progression=forecast_progression,
+        recommended_action=recommended_action,
+        observed_at=observed_at,
+    )
+
+    ok = _dispatch_alert(token, chat_ids, html_msg, plain_msg)
+    if ok:
+        _alerted.add(dedup_key)
+        logger.info(
+            "[Telegram Alert] High-risk packet alert sent for paired device %s (%s): %s",
+            device_ip,
+            device_name,
+            flow_sig,
+        )
+    return ok
+
+
+# — scan cycle —
+def _scan(db: Session, bot_token: str, chat_id_conf: str) -> None:
+    """One scan tick: query open high/critical findings + endpoint findings + active threats,
+    send Telegram alerts for anything new."""
+    global _initial_scan_done
+    org_ids: list[str] = [
+        r[0] for r in db.execute(select(AssetVulnerability.org_id).distinct()).all()
+    ]
+    # Also check any orgs present in endpoint telemetry
+    from app.services.endpoint_telemetry import _DEVICE_TELEMETRY_STORE, list_endpoint_findings_for_org
+
+    for (o_id, _) in list(_DEVICE_TELEMETRY_STORE.keys()):
+        if o_id not in org_ids:
+            org_ids.append(o_id)
+
+    if not org_ids:
+        return
+
+    now = datetime.now(timezone.utc)
+
+    for org_id in org_ids:
+        _scan_org(db, org_id, bot_token, chat_id_conf, now)
+
+    _initial_scan_done = True
+
+
+def _scan_org(db: Session, org_id: str, bot_token: str, chat_id_conf: str, now: datetime | None = None) -> None:
+    """Scan and dispatch alerts for a specific organization with factual deduplication."""
+    global _initial_scan_done
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    # 1. Open high / critical database findings
+    findings = db.scalars(
+        select(AssetVulnerability)
+        .join(Vulnerability, AssetVulnerability.vulnerability_id == Vulnerability.id)
+        .where(
+            AssetVulnerability.org_id == org_id,
+            AssetVulnerability.status == "open",
+            Vulnerability.severity.in_(["high", "critical"]),
+        )
+        .order_by(AssetVulnerability.detected_at.desc())
+    ).all()
+
+    # On initial boot tick, mark pre-existing findings older than 15 mins as acknowledged
+    if not _initial_scan_done:
+        recent_cutoff = now - timedelta(minutes=15)
+        for f in findings:
+            f_time = f.detected_at.replace(tzinfo=timezone.utc) if f.detected_at and f.detected_at.tzinfo is None else f.detected_at
+            if f_time and f_time < recent_cutoff:
+                dev = f.asset.hostname if getattr(f, "asset", None) and f.asset.hostname else (f.asset.ip if getattr(f, "asset", None) else getattr(f, "asset_id", "")[:8])
+                cve = f.vulnerability.cve_id if getattr(f, "vulnerability", None) and f.vulnerability.cve_id else getattr(f, "id", "")
+                svc = getattr(f, "service", None)
+                if svc is None and getattr(f, "service_id", None):
+                    svc = db.get(Service, f.service_id)
+                ver = svc.version if svc and getattr(svc, "version", None) else "unknown"
+                sev = f.vulnerability.severity if getattr(f, "vulnerability", None) and getattr(f.vulnerability, "severity", None) else "high"
+                _alerted.add(make_finding_fingerprint(org_id, dev, cve, ver, sev, False))
+
+    for f in findings:
+        dev = f.asset.hostname if getattr(f, "asset", None) and f.asset.hostname else (f.asset.ip if getattr(f, "asset", None) else getattr(f, "asset_id", "")[:8])
+        cve = f.vulnerability.cve_id if getattr(f, "vulnerability", None) and f.vulnerability.cve_id else getattr(f, "id", "")
+        svc = getattr(f, "service", None)
+        if svc is None and getattr(f, "service_id", None):
+            svc = db.get(Service, f.service_id)
+        ver = svc.version if svc and getattr(svc, "version", None) else "unknown"
+        sev = f.vulnerability.severity if getattr(f, "vulnerability", None) and getattr(f.vulnerability, "severity", None) else "high"
+        key = make_finding_fingerprint(org_id, dev, cve, ver, sev, False)
+        if key in _alerted:
+            continue
+        try:
+            html_msg, plain_msg = _format_finding_alert(f)
+            if _dispatch_alert(bot_token, chat_id_conf, html_msg, plain_msg):
+                _alerted.add(key)
+        except Exception:
+            logger.exception("failed to alert finding %s", f.id)
+
+    # 2. Phase 03/04 Endpoint software findings
+    from app.services.endpoint_telemetry import (
+        get_endpoint_finding_status,
+        list_endpoint_findings_for_org,
+    )
+
+    try:
+        ep_findings = list_endpoint_findings_for_org(org_id)
+        for c_finding, telemetry in ep_findings:
+            ep_status = get_endpoint_finding_status(org_id, c_finding.finding_id)
+            if ep_status != "open":
+                continue
+            is_high_or_crit = c_finding.severity in ("high", "critical")
+            is_kev = bool(c_finding.in_kev)
+            if not (is_high_or_crit or is_kev):
+                continue
+
+            cve_ref = c_finding.cve_id or c_finding.finding_id
+            ver_ref = c_finding.observed_version or "unknown"
+            key = make_finding_fingerprint(
+                org_id,
+                c_finding.device_id,
+                cve_ref,
+                ver_ref,
+                c_finding.severity,
+                is_kev,
+            )
+            if key in _alerted:
+                continue
+
+            try:
+                html_msg, plain_msg = _format_endpoint_finding_alert(c_finding, telemetry)
+                if _dispatch_alert(bot_token, chat_id_conf, html_msg, plain_msg):
+                    _alerted.add(key)
+            except Exception:
+                logger.exception("failed to alert endpoint finding %s", c_finding.finding_id)
+    except Exception:
+        logger.exception("failed to check endpoint findings for org %s", org_id)
+
+    # 3. Active network threats
+    since = now - timedelta(minutes=5)
+    rows = db.scalars(
+        select(NetworkDevice).where(
+            NetworkDevice.org_id == org_id,
+            NetworkDevice.last_seen >= since,
+        )
+    ).all()
+
+    from app.services.live import _deepscan_ports_by_ip, _scan_status
+
+    scanned_ips, _ = _scan_status(db, org_id)
+    ports_by_ip = _deepscan_ports_by_ip(db, org_id)
+
+    devices = []
+    for r in rows:
+        scanned = r.ip in scanned_ips or r.last_scanned_at is not None
+        devices.append(
+            DeviceView(
+                ip=r.ip,
+                mac=r.mac,
+                hostname=r.hostname,
+                is_gateway=r.is_gateway,
+                is_self=r.is_self,
+                online=r.online,
+                first_seen=r.first_seen,
+                last_seen=r.last_seen,
+                scanned=scanned,
+                vuln_count=None,
+                worst_severity=None,
+                open_ports=ports_by_ip.get(r.ip, []),
+            )
+        )
+
+    threat_rows = db.scalars(
+        select(LiveObservation).where(
+            LiveObservation.org_id == org_id,
+            LiveObservation.last_seen >= since,
+        )
+    ).all()
+
+    domains = [
+        DomainView(
+            id=t.id,
+            domain=t.domain,
+            band=t.band,
+            score=float(t.score),
+            source_host=t.source_host,
+            reasons=(
+                t.verdict_json.get("reasons", [])
+                if isinstance(t.verdict_json, dict)
+                else []
+            ),
+        )
+        for t in threat_rows
+    ]
+
+    threats = detect_threats(devices, domains, now)
+
+    for t in threats:
+        key = ("threat", org_id, t.id)
+        if key in _alerted:
+            continue
+        try:
+            html_msg, plain_msg = _format_threat_alert(t)
+            if _dispatch_alert(bot_token, chat_id_conf, html_msg, plain_msg):
+                _alerted.add(key)
+        except Exception:
+            logger.exception("failed to alert threat %s", t.id)
+
+    # 4. Paired Device High-Risk Packet & Flow Alerts
+    try:
+        from app.models.endpoint import EndpointAgent
+        from app.services.traffic.session_manager import tracking_manager
+
+        paired_agents = db.scalars(
+            select(EndpointAgent).where(
+                EndpointAgent.org_id == org_id,
+                EndpointAgent.status.in_(["ONLINE", "PAIRED", "STALE"]),
+            )
+        ).all()
+
+        for agent in paired_agents:
+            dev_ip = (agent.current_ip or "").strip()
+            if not dev_ip:
+                continue
+
+            sess = (
+                tracking_manager.get_active_session_for_device(org_id, agent.device_id)
+                or tracking_manager.get_active_session_for_device(org_id, dev_ip)
+                or (tracking_manager.get_active_session_for_device(org_id, agent.agent_id) if agent.agent_id else None)
+            )
+
+            if not sess:
+                continue
+
+            det = getattr(sess, "last_detection", None)
+            if not det:
+                continue
+
+            verdict_str = getattr(det, "verdict", "NORMAL").upper()
+            risk_val = getattr(det, "risk_score", getattr(det, "confidence", 0.0))
+            cat = getattr(det, "attack_category", "SUSPICIOUS_TRAFFIC") or "SUSPICIOUS_TRAFFIC"
+
+            is_high_risk = (
+                verdict_str in ("ANOMALOUS", "SUSPICIOUS")
+                or (isinstance(risk_val, (int, float)) and risk_val >= 0.70)
+                or (str(cat).upper() not in ("BENIGN", "NORMAL", "UNKNOWN"))
+            )
+
+            if is_high_risk:
+                all_flows = sess.aggregator.get_all_flows() if hasattr(sess, "aggregator") else []
+                top_dest = sess.aggregator.get_top_destinations(limit=3) if hasattr(sess, "aggregator") else []
+
+                if all_flows:
+                    suspicious_packet = {
+                        "src_ip": getattr(all_flows[0], "src_ip", dev_ip),
+                        "dst_ip": getattr(all_flows[0], "dst_ip", "10.0.0.1"),
+                        "src_port": getattr(all_flows[0], "src_port", 0),
+                        "dst_port": getattr(all_flows[0], "dst_port", 0),
+                        "protocol": getattr(all_flows[0], "protocol", "TCP"),
+                        "packets": getattr(all_flows[0], "total_packets", 1),
+                        "bytes": getattr(all_flows[0], "total_bytes", 64),
+                        "summary": f"High risk {getattr(all_flows[0], 'protocol', 'TCP')} flow to {getattr(all_flows[0], 'dst_ip', '')}",
+                    }
+                elif top_dest:
+                    d = top_dest[0]
+                    suspicious_packet = {
+                        "src_ip": dev_ip,
+                        "dst_ip": d.get("destination_ip", "unknown"),
+                        "src_port": 0,
+                        "dst_port": d.get("destination_port", 0),
+                        "protocol": d.get("protocol", "TCP"),
+                        "packets": d.get("connection_count", 1),
+                        "bytes": d.get("connection_count", 1) * 64,
+                        "summary": f"Suspicious connection burst to {d.get('destination_ip')}:{d.get('destination_port')}",
+                    }
+                else:
+                    suspicious_packet = {
+                        "src_ip": dev_ip,
+                        "dst_ip": "Network Target",
+                        "src_port": 0,
+                        "dst_port": 0,
+                        "protocol": "TCP",
+                        "packets": getattr(sess.aggregator, "packet_count", 1) if hasattr(sess, "aggregator") else 1,
+                        "bytes": getattr(sess.aggregator, "byte_count", 64) if hasattr(sess, "aggregator") else 64,
+                        "summary": "Anomalous traffic pattern detected by neural temporal forecaster",
+                    }
+
+                fc = getattr(sess, "last_forecast", None)
+                prog_str = getattr(fc, "predicted_progression", None)
+
+                notify_paired_device_packet_risk(
+                    org_id=org_id,
+                    device_ip=dev_ip,
+                    packet_info=suspicious_packet,
+                    device_name=agent.hostname,
+                    device_id=agent.device_id,
+                    risk_score=float(risk_val) if risk_val else 0.85,
+                    verdict=verdict_str,
+                    attack_category=cat,
+                    threat_details=getattr(det, "details", "Neural sequence detector flagged abnormal packet traffic on paired endpoint."),
+                    forecast_progression=prog_str,
+                    recommended_action="Inspect running processes and restrict outbound network access from this paired device.",
+                    observed_at=now,
+                    bot_token=bot_token,
+                    chat_id_conf=chat_id_conf,
+                )
+    except Exception:
+        logger.exception("failed checking paired device packet risks for org %s", org_id)
+
+
+
+# — public control & diagnostics —
+def is_running() -> bool:
+    return _running
+
+
+def get_status() -> dict:
+    from app.config import get_settings
+    s = get_settings()
+    configured = bool(s.telegram_bot_token and s.telegram_chat_id)
+    chat_ids = _get_chat_ids(s.telegram_chat_id)
+    return {
+        "configured": configured,
+        "running": _running,
+        "chat_ids_count": len(chat_ids),
+        "chat_ids_masked": [f"{cid[:3]}***{cid[-2:]}" if len(cid) > 5 else cid for cid in chat_ids],
+        "alerted_count": len(_alerted),
+    }
+
+
+def send_test_alert(custom_text: str | None = None) -> dict:
+    from app.config import get_settings
+    s = get_settings()
+    if not s.telegram_bot_token or not s.telegram_chat_id:
+        return {"success": False, "error": "Telegram bot token or chat ID is not configured."}
+
+    chat_ids = _get_chat_ids(s.telegram_chat_id)
+    ts = _ist_timestamp()
+    html_msg = (
+        f"🧪 <b>[DRISHTI SYSTEM DIAGNOSTIC]</b>\n"
+        f"<b>Telegram Alert Subsystem Test</b>\n\n"
+        f"• <b>Status:</b> <code>Active & Operational</code>\n"
+        f"• <b>Time:</b> <code>{html.escape(ts)}</code>\n"
+        f"• <b>Notes:</b> <code>{html.escape(custom_text or 'Manual verification triggered successfully.')}</code>\n\n"
+        f"🛡️ <i>Drishti Security Engine</i>"
+    )
+    plain_msg = (
+        f"[DRISHTI SYSTEM DIAGNOSTIC]\n"
+        f"Telegram Alert Subsystem Test\n\n"
+        f"• Status: Active & Operational\n"
+        f"• Time: {ts}\n"
+        f"• Notes: {custom_text or 'Manual verification triggered successfully.'}\n\n"
+        f"Drishti Security Engine"
+    )
+
+    results = []
+    for cid in chat_ids:
+        ok = _send_telegram(s.telegram_bot_token, cid, html_msg, plain_msg)
+        results.append({"chat_id": cid, "delivered": ok})
+        time.sleep(0.5)
+
+    any_ok = any(r["delivered"] for r in results)
+    return {"success": any_ok, "results": results}
+
+
+def start() -> None:
+    """Start the background ticker (called from app lifespan)."""
+    global _running, _thread
+    if _running:
+        return
+
+    from app.config import get_settings
+
+    s = get_settings()
+    if not s.telegram_bot_token or not s.telegram_chat_id:
+        logger.info(
+            "Telegram alerts disabled (no bot token / chat id configured)"
+        )
+        return
+
+    _running = True
+
+    def _loop() -> None:
+        # wait a few seconds so the DB is fully ready after boot
+        time.sleep(5)
+        bot_token = s.telegram_bot_token
+        chat_id = s.telegram_chat_id
+        while _running:
+            try:
+                db = SessionLocal()
+                try:
+                    _scan(db, bot_token, chat_id)
+                finally:
+                    db.close()
+            except Exception:
+                logger.exception("telegram scan cycle failed")
+            time.sleep(_TICK_SECONDS)
+
+    _thread = threading.Thread(target=_loop, daemon=True, name="telegram-alerts")
+    _thread.start()
+    logger.info("Telegram alert service started (tick=%ds)", _TICK_SECONDS)
+
+
+def stop() -> None:
+    """Stop the background ticker."""
+    global _running
+    _running = False
